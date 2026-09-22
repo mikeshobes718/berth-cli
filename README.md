@@ -148,7 +148,7 @@ berth storage sign --app A BUCKET KEY [--expires 3600]
 
 ```
 berth functions list --app A
-berth functions deploy --app A NAME FILE [--verify key|user|none] [--timeout-ms N] [--memory-mb N]
+berth functions deploy --app A NAME FILE [--verify key|user|none] [--timeout-ms N] [--memory-mb N] [--schedule CRON | --no-schedule]
 berth functions show --app A NAME [--source]
 berth functions logs --app A NAME [--limit N]
 berth functions invoke --app A NAME [--data JSON] [--method POST] [--path-query 'a=b']
@@ -158,7 +158,7 @@ berth env set --app A NAME=VALUE [NAME=VALUE...]   # NAME alone prompts, so the 
 berth env unset --app A NAME
 ```
 
-A function is one file: `export default async (req) => new Response("hi")`.
+A function is one file: `export default async (req) => new Response("hi")`. Imports from `npm:`, `jsr:` and `https://` work. `--schedule "*/15 * * * *"` also runs it on a cron schedule (UTC); redeploys keep the schedule until `--no-schedule`.
 
 ### Webhooks
 
@@ -174,6 +174,7 @@ berth webhooks update --app A ID [--url U] [--events E] [--enable|--disable]
 ```
 berth sql --app A "QUERY" [--param V]... [--read-only] [--timeout-ms N]
 berth sql --app A -f FILE
+berth rpc --app A FUNCTION [name=value]... [--data JSON]   # call a Postgres function made with berth sql
 berth logs --app A [--limit N] [--status 4xx]
 berth api METHOD PATH [--data JSON] [--app A]   # raw call, prints JSON
 berth completion bash|zsh                       # eval "$(berth completion zsh)"

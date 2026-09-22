@@ -1563,11 +1563,18 @@ def cmd_functions_deploy(args) -> None:
         body["timeout_ms"] = args.timeout_ms
     if args.memory_mb is not None:
         body["memory_mb"] = args.memory_mb
+    if args.no_schedule:
+        body["schedule"] = None
+    elif args.schedule:
+        body["schedule"] = args.schedule
     payload = app_api(app, "PUT", app_path(app, "functions", args.name, "deployment"), body=body, timeout=120)
 
     def human():
         print(f"Deployed {args.name} to {app}.")
         print(f"URL: {api_base()}{app_path(app, 'functions', args.name)}")
+        sched = (payload.get("function") or {}).get("schedule")
+        if sched:
+            print(f"Schedule: {sched} (UTC)")
     emit(payload, human)
 
 
@@ -1753,6 +1760,38 @@ def cmd_sql(args) -> None:
         if payload.get("truncated"):
             tail += " (truncated to the first 1000 rows)"
         print(tail)
+    emit(payload, human)
+
+
+def cmd_rpc(args) -> None:
+    app = resolve_app(args)
+    body: dict = {}
+    if args.data:
+        try:
+            body = json.loads(args.data)
+        except ValueError:
+            usage("--data must be a JSON object.")
+        if not isinstance(body, dict):
+            usage("--data must be a JSON object.")
+    for pair in args.arg or []:
+        key, sep, value = pair.partition("=")
+        if not sep or not key:
+            usage(f"Write arguments as name=value, not {pair}.")
+        try:
+            body[key] = json.loads(value)
+        except ValueError:
+            body[key] = value
+    payload = app_api(app, "POST", app_path(app, "rpc", args.function), body=body)
+    if isinstance(payload, dict) and set(payload) == {"data"}:
+        payload = payload["data"]
+    elif isinstance(payload, dict) and set(payload) == {"body"} and payload["body"].strip() == "null":
+        payload = None
+
+    def human():
+        if isinstance(payload, list) and payload and all(isinstance(r, dict) for r in payload):
+            print_table(payload)
+        else:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
     emit(payload, human)
 
 
@@ -2279,6 +2318,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--verify", choices=("key", "user", "none"), help="Who may call it. key: any app key; user: a signed-in user.")
     p.add_argument("--timeout-ms", type=int)
     p.add_argument("--memory-mb", type=int)
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--schedule", metavar="CRON", help='Also run it on a cron schedule in UTC, e.g. "*/15 * * * *" or @hourly.')
+    g.add_argument("--no-schedule", action="store_true", help="Remove the schedule. Redeploys keep it otherwise.")
     p = cmd(fn, "show", cmd_functions_show, "Show a function's deployment.", "berth functions show --app demo hello --source")
     app_opt(p)
     p.add_argument("name", metavar="NAME")
@@ -2349,6 +2391,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--param", action="append", metavar="VALUE", help="Value for $1, $2, ... Repeatable.")
     p.add_argument("--read-only", action="store_true", help="Reject writes.")
     p.add_argument("--timeout-ms", type=int)
+
+    p = cmd(sub, "rpc", cmd_rpc, "Call a Postgres function you created with berth sql.",
+            ["berth rpc --app demo add_nums a=2 b=3",
+             "berth rpc --app demo claim_job --data '{\"worker\": \"w1\", \"tags\": [\"a\"]}'"])
+    app_opt(p)
+    p.add_argument("function", metavar="FUNCTION")
+    p.add_argument("arg", nargs="*", metavar="NAME=VALUE", help="Named arguments. Values are read as JSON when they parse, else as text.")
+    p.add_argument("--data", metavar="JSON", help="All arguments as one JSON object.")
 
     p = cmd(sub, "logs", cmd_logs, "Show recent API requests to an app.", ["berth logs --app demo --limit 50", "berth logs --app demo --status 4xx"])
     app_opt(p)
