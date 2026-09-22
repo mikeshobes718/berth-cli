@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""Berth command line. Talks to https://api.atberth.com/v1. No extra packages."""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+DEFAULT_API = "https://api.atberth.com/v1"
+CONFIG_PATH = Path.home() / ".config" / "berth" / "config.json"
+NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
+TYPES = ("text", "integer", "boolean", "timestamptz")
+JSON = False
+
+
+def die(message: str, payload: dict | None = None, code: int = 1) -> None:
+    if JSON:
+        print(json.dumps(payload or {"error": "cli", "message": message}))
+    else:
+        print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {"api": DEFAULT_API, "token": "", "apps": {}}
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        die("Could not read ~/.config/berth/config.json.")
+    if not isinstance(data, dict):
+        die("Could not read ~/.config/berth/config.json.")
+    data.setdefault("api", DEFAULT_API)
+    data.setdefault("token", "")
+    data.setdefault("apps", {})
+    return data
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONFIG_PATH.parent, 0o700)
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(CONFIG_PATH)
+    os.chmod(CONFIG_PATH, 0o600)
+
+
+def api_base(cfg: dict) -> str:
+    return str(cfg.get("api") or DEFAULT_API).rstrip("/")
+
+
+def request(method: str, path: str, token: str, body: dict | None = None, base: str | None = None) -> tuple[int, dict]:
+    cfg = load_config()
+    url = (base or api_base(cfg)) + path
+    data = None
+    headers = {"Accept": "application/json", "Authorization": "Bearer " + token}
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as res:
+            raw = res.read().decode() or "{}"
+            return res.status, json.loads(raw)
+    except urllib.error.HTTPError as err:
+        raw = err.read().decode()
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            payload = {"error": "bad_response", "message": "The API returned a response that was not JSON."}
+        if not isinstance(payload, dict):
+            payload = {"error": "bad_response", "message": "The API returned a response that was not JSON."}
+        return err.code, payload
+    except urllib.error.URLError:
+        return 0, {"error": "network", "message": "Could not reach the Berth API. Check your network and try again."}
+
+
+def emit(payload: dict, human: str) -> None:
+    if JSON:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(human)
+
+
+def check(code: int, payload: dict, ok: set[int]) -> dict:
+    if code in ok:
+        return payload
+    message = payload.get("message") if isinstance(payload, dict) else None
+    die(message or "The request failed.", payload if isinstance(payload, dict) else None)
+
+
+def login_token(cfg: dict) -> str:
+    token = cfg.get("token") or ""
+    if not token:
+        die("Run berth login first.")
+    return token
+
+
+def request_app(method: str, path: str, app: str, body: dict | None = None) -> tuple[int, dict]:
+    cfg = load_config()
+    app_token = (cfg.get("apps") or {}).get(app) or ""
+    admin = cfg.get("token") or ""
+    if app_token:
+        code, payload = request(method, path, app_token, body)
+        if code != 401 or not admin or admin == app_token:
+            return code, payload
+    if admin:
+        return request(method, path, admin, body)
+    die("Run berth login first.")
+    return 0, {}
+
+
+def require_name(name: str) -> str:
+    if not NAME_RE.fullmatch(name):
+        die("Use 2 to 32 characters: a letter first, then lowercase letters, numbers, or underscore.")
+    return name
+
+
+def human_row(row: dict) -> str:
+    lines = []
+    for key, value in row.items():
+        if isinstance(value, bool):
+            shown = "true" if value else "false"
+        else:
+            shown = "" if value is None else str(value)
+        lines.append(f"{key}: {shown}")
+    return "\n".join(lines)
+
+
+def cmd_login(args: argparse.Namespace) -> None:
+    if args.token:
+        token = args.token.strip()
+    elif not sys.stdin.isatty():
+        token = sys.stdin.read().strip()
+    else:
+        token = getpass.getpass("Token: ").strip()
+    if not token:
+        die("Enter a token.")
+    cfg = load_config()
+    code, payload = request("GET", "/me", token)
+    if code == 200:
+        cfg["token"] = token
+        save_config(cfg)
+        emit({"ok": True, "role": "admin"}, "Logged in.")
+        return
+    if code == 403:
+        cfg["token"] = token
+        save_config(cfg)
+        emit({"ok": True, "role": "app"}, "Logged in with an app token.")
+        return
+    check(code, payload, set())
+
+
+def cmd_whoami(_args: argparse.Namespace) -> None:
+    cfg = load_config()
+    token = login_token(cfg)
+    code, payload = request("GET", "/me", token)
+    if code == 200:
+        emit({"role": "admin", "api": api_base(cfg)}, f"role: admin\napi: {api_base(cfg)}")
+        return
+    if code == 403:
+        emit(
+            {"role": "app", "api": api_base(cfg)},
+            f"role: app token\napi: {api_base(cfg)}",
+        )
+        return
+    check(code, payload, set())
+
+
+def cmd_apps_list(_args: argparse.Namespace) -> None:
+    cfg = load_config()
+    code, payload = request("GET", "/apps", login_token(cfg))
+    payload = check(code, payload, {200})
+    apps = payload.get("apps") or []
+    if JSON:
+        print(json.dumps(payload, indent=2))
+        return
+    if not apps:
+        print("No apps yet.")
+        return
+    for app in apps:
+        print(app.get("slug") or app.get("name"))
+
+
+def cmd_apps_create(args: argparse.Namespace) -> None:
+    name = require_name(args.name)
+    cfg = load_config()
+    code, payload = request("POST", "/apps", login_token(cfg), {"name": name})
+    payload = check(code, payload, {201})
+    slug = payload.get("slug") or name
+    token = payload.get("token") or ""
+    if token:
+        cfg.setdefault("apps", {})[slug] = token
+        save_config(cfg)
+    if JSON:
+        print(json.dumps(payload, indent=2))
+        return
+    print(f"Created {slug}.")
+    print("Save this app token. It is shown once.")
+    print(token)
+
+
+def cmd_apps_delete(args: argparse.Namespace) -> None:
+    name = require_name(args.name)
+    cfg = load_config()
+    code, payload = request("DELETE", "/apps/" + name, login_token(cfg))
+    payload = check(code, payload, {200})
+    apps = cfg.get("apps") or {}
+    if name in apps:
+        del apps[name]
+        cfg["apps"] = apps
+        save_config(cfg)
+    emit(payload, f"Deleted {name}.")
+
+
+def cmd_tables_list(args: argparse.Namespace) -> None:
+    app = require_name(args.app)
+    code, payload = request_app("GET", f"/apps/{app}/tables", app)
+    payload = check(code, payload, {200})
+    if JSON:
+        print(json.dumps(payload, indent=2))
+        return
+    tables = payload.get("tables") or []
+    if not tables:
+        print("No tables yet.")
+        return
+    for table in tables:
+        cols = ", ".join(f"{col['name']}:{col['type']}" for col in table.get("columns") or [])
+        print(f"{table.get('name')}  {cols}")
+
+
+def cmd_tables_create(args: argparse.Namespace) -> None:
+    app = require_name(args.app)
+    table = require_name(args.table)
+    if not args.columns:
+        die("Add at least one column, for example body:text.")
+    columns = []
+    for item in args.columns:
+        if ":" not in item:
+            die("Write columns as name:type, for example body:text.")
+        col_name, col_type = item.split(":", 1)
+        if not NAME_RE.fullmatch(col_name):
+            die("Use 2 to 32 characters: a letter first, then lowercase letters, numbers, or underscore.")
+        if col_type not in TYPES:
+            die("Types are text, integer, boolean, and timestamptz.")
+        columns.append({"name": col_name, "type": col_type})
+    code, payload = request_app(
+        "POST",
+        f"/apps/{app}/tables",
+        app,
+        {"name": table, "columns": columns},
+    )
+    payload = check(code, payload, {201})
+    if JSON:
+        print(json.dumps(payload, indent=2))
+        return
+    print(f"Created table {payload.get('name', table)} on {app}.")
+
+
+def column_types(app: str, table: str) -> dict[str, str]:
+    code, payload = request_app("GET", f"/apps/{app}/tables", app)
+    payload = check(code, payload, {200})
+    for item in payload.get("tables") or []:
+        if item.get("name") == table:
+            return {col["name"]: col["type"] for col in item.get("columns") or []}
+    die("That table does not exist.")
+    return {}
+
+
+def coerce_cli(coltype: str, raw: str, colname: str):
+    if coltype == "integer":
+        if not re.fullmatch(r"-?\d+", raw):
+            die(f"Column {colname} expects an integer.")
+        return int(raw)
+    if coltype == "boolean":
+        if raw not in ("true", "false"):
+            die(f"Column {colname} expects true or false.")
+        return raw == "true"
+    if coltype == "timestamptz":
+        return raw
+    if coltype == "text":
+        return raw
+    die(f"Column {colname} cannot be set.")
+
+
+def cmd_rows_list(args: argparse.Namespace) -> None:
+    app = require_name(args.app)
+    table = require_name(args.table)
+    path = f"/apps/{app}/tables/{table}"
+    if args.limit is not None:
+        if args.limit < 1 or args.limit > 200:
+            die("Limit must be a whole number from 1 to 200.")
+        path += f"?limit={args.limit}"
+    code, payload = request_app("GET", path, app)
+    payload = check(code, payload, {200})
+    rows = payload.get("rows") or []
+    if JSON:
+        print(json.dumps(payload, indent=2))
+        return
+    if not rows:
+        print("No rows yet.")
+        return
+    blocks = [human_row(row) for row in rows]
+    print("\n\n".join(blocks))
+
+
+def cmd_rows_add(args: argparse.Namespace) -> None:
+    app = require_name(args.app)
+    table = require_name(args.table)
+    if not args.values:
+        die("Add at least one value, for example body=hello.")
+    types = column_types(app, table)
+    body = {}
+    for item in args.values:
+        if "=" not in item:
+            die("Write values as name=value, for example body=hello.")
+        key, raw = item.split("=", 1)
+        if not NAME_RE.fullmatch(key):
+            die("Use 2 to 32 characters: a letter first, then lowercase letters, numbers, or underscore.")
+        if key not in types:
+            die("That column does not exist.")
+        body[key] = coerce_cli(types[key], raw, key)
+    code, payload = request_app("POST", f"/apps/{app}/tables/{table}", app, body)
+    payload = check(code, payload, {201})
+    row = payload.get("row") or {}
+    if JSON:
+        print(json.dumps(payload, indent=2))
+        return
+    print("Added a row.")
+    print(human_row(row))
+
+
+def cmd_rows_get(args: argparse.Namespace) -> None:
+    app = require_name(args.app)
+    table = require_name(args.table)
+    code, payload = request_app("GET", f"/apps/{app}/tables/{table}/{args.id}", app)
+    payload = check(code, payload, {200})
+    row = payload.get("row") or {}
+    if JSON:
+        print(json.dumps(payload, indent=2))
+        return
+    print(human_row(row))
+
+
+def cmd_rows_rm(args: argparse.Namespace) -> None:
+    app = require_name(args.app)
+    table = require_name(args.table)
+    code, payload = request_app("DELETE", f"/apps/{app}/tables/{table}/{args.id}", app)
+    payload = check(code, payload, {200})
+    emit(payload, "Deleted the row.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="Print JSON for scripts.")
+
+    common.add_argument("--api", help=f"API base URL. Default: {DEFAULT_API}")
+    parser = argparse.ArgumentParser(
+        prog="berth",
+        description="Use Berth from the command line. No website required.",
+        parents=[common],
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    login = sub.add_parser("login", help="Save an API token on this machine.", parents=[common])
+    login.add_argument("--token", help="Token to save. If omitted, you are prompted.")
+    login.set_defaults(func=cmd_login)
+
+    who = sub.add_parser("whoami", help="Show the saved login.", parents=[common])
+    who.set_defaults(func=cmd_whoami)
+
+    apps = sub.add_parser("apps", help="Create and list apps.", parents=[common])
+    apps_sub = apps.add_subparsers(dest="apps_cmd", required=True)
+    apps_list = apps_sub.add_parser("list", help="List apps.", parents=[common])
+    apps_list.set_defaults(func=cmd_apps_list)
+    apps_create = apps_sub.add_parser("create", help="Create an app and its database.", parents=[common])
+    apps_create.add_argument("name", help="App name. Lowercase, 2 to 32 characters.")
+    apps_create.set_defaults(func=cmd_apps_create)
+    apps_delete = apps_sub.add_parser("delete", help="Delete an app and its database.", parents=[common])
+    apps_delete.add_argument("name", help="App name.")
+    apps_delete.set_defaults(func=cmd_apps_delete)
+
+    tables = sub.add_parser("tables", help="Create and list tables.", parents=[common])
+    tables_sub = tables.add_subparsers(dest="tables_cmd", required=True)
+    tables_list = tables_sub.add_parser("list", help="List tables in an app.", parents=[common])
+    tables_list.add_argument("--app", required=True, help="App name.")
+    tables_list.set_defaults(func=cmd_tables_list)
+    tables_create = tables_sub.add_parser("create", help="Create a table.", parents=[common])
+    tables_create.add_argument("--app", required=True, help="App name.")
+    tables_create.add_argument("table", help="Table name.")
+    tables_create.add_argument("columns", nargs="+", help="Columns as name:type. Example: body:text")
+    tables_create.set_defaults(func=cmd_tables_create)
+
+    rows = sub.add_parser("rows", help="Read and write rows.", parents=[common])
+    rows_sub = rows.add_subparsers(dest="rows_cmd", required=True)
+    rows_list = rows_sub.add_parser("list", help="List rows.", parents=[common])
+    rows_list.add_argument("--app", required=True, help="App name.")
+    rows_list.add_argument("table", help="Table name.")
+    rows_list.add_argument("--limit", type=int, help="How many rows to return. Default 50. Max 200.")
+    rows_list.set_defaults(func=cmd_rows_list)
+    rows_add = rows_sub.add_parser("add", help="Insert one row.", parents=[common])
+    rows_add.add_argument("--app", required=True, help="App name.")
+    rows_add.add_argument("table", help="Table name.")
+    rows_add.add_argument("values", nargs="+", help="Column values as name=value. Example: body=hello")
+    rows_add.set_defaults(func=cmd_rows_add)
+    rows_get = rows_sub.add_parser("get", help="Read one row by id.", parents=[common])
+    rows_get.add_argument("--app", required=True, help="App name.")
+    rows_get.add_argument("table", help="Table name.")
+    rows_get.add_argument("id", help="Row id.")
+    rows_get.set_defaults(func=cmd_rows_get)
+    rows_rm = rows_sub.add_parser("rm", help="Delete one row by id.", parents=[common])
+    rows_rm.add_argument("--app", required=True, help="App name.")
+    rows_rm.add_argument("table", help="Table name.")
+    rows_rm.add_argument("id", help="Row id.")
+    rows_rm.set_defaults(func=cmd_rows_rm)
+    return parser
+
+
+def main() -> None:
+    global JSON
+    parser = build_parser()
+    args = parser.parse_args()
+    JSON = bool(args.json)
+    if getattr(args, "api", None):
+        cfg = load_config()
+        cfg["api"] = args.api.rstrip("/")
+        save_config(cfg)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
